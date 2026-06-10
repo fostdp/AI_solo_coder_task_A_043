@@ -197,7 +197,70 @@ CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
 CREATE INDEX IF NOT EXISTS idx_alerts_sent ON alerts(is_sent);
 
 -- ========================================
--- 污染指数计算视图
+-- 工程化增强：高级索引
+-- ========================================
+
+-- BRIN索引：适合时间序列数据（按插入顺序物理存储），比B-Tree小100x
+CREATE INDEX IF NOT EXISTS idx_xrf_year_brin ON xrf_measurements USING BRIN(measurement_year);
+CREATE INDEX IF NOT EXISTS idx_xrf_created_brin ON xrf_measurements USING BRIN(created_at);
+CREATE INDEX IF NOT EXISTS idx_isotope_year_brin ON isotope_ratios USING BRIN(measurement_year);
+CREATE INDEX IF NOT EXISTS idx_speciation_year_brin ON metal_speciation USING BRIN(measurement_year);
+
+-- 复合索引：覆盖高频查询
+CREATE INDEX IF NOT EXISTS idx_xrf_site_year ON xrf_measurements(site_id, measurement_year DESC);
+CREATE INDEX IF NOT EXISTS idx_xrf_site_created ON xrf_measurements(site_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_isotope_site_year ON isotope_ratios(site_id, measurement_year DESC);
+CREATE INDEX IF NOT EXISTS idx_speciation_site_year_metal ON metal_speciation(site_id, measurement_year DESC, metal_type);
+
+-- Partial索引：仅索引活跃数据，大幅减小索引体积
+CREATE INDEX IF NOT EXISTS idx_alerts_pending ON alerts(site_id) WHERE is_sent = FALSE;
+CREATE INDEX IF NOT EXISTS idx_alerts_high_severity ON alerts(severity, created_at DESC) WHERE severity IN ('高', '严重');
+
+-- GIN索引：加速JSONB和数组查询
+CREATE INDEX IF NOT EXISTS idx_remediation_metals_gin ON remediation_technologies USING GIN(applicable_metals);
+CREATE INDEX IF NOT EXISTS idx_assessment_details_gin ON remediation_assessments USING GIN(assessment_details);
+
+-- ========================================
+-- 工程化增强：物化视图（用于高频概览查询）
+-- ========================================
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_site_latest_pollution AS
+SELECT
+    m.site_id,
+    s.name AS site_name,
+    s.metal_type,
+    s.scale,
+    s.country,
+    m.measurement_year,
+    m.pb, m.zn, m.cu, m.as_val, m.hg, m.cd,
+    ROUND(
+        (CASE WHEN m.pb > 0 THEN (m.pb / 800.0) ELSE 0 END +
+         CASE WHEN m.zn > 0 THEN (m.zn / 5000.0) ELSE 0 END +
+         CASE WHEN m.cu > 0 THEN (m.cu / 1800.0) ELSE 0 END +
+         CASE WHEN m.as_val > 0 THEN (m.as_val / 250.0) ELSE 0 END +
+         CASE WHEN m.hg > 0 THEN (m.hg / 38.0) ELSE 0 END +
+         CASE WHEN m.cd > 0 THEN (m.cd / 47.0) ELSE 0 END) / 6.0,
+    4) AS pollution_index,
+    ST_AsGeoJSON(s.geom) AS geom_json,
+    ST_X(s.geom) AS lng,
+    ST_Y(s.geom) AS lat
+FROM xrf_measurements m
+JOIN sites s ON m.site_id = s.id
+WHERE m.measurement_year = (SELECT MAX(measurement_year) FROM xrf_measurements m2 WHERE m2.site_id = m.site_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_pollution_site_id ON mv_site_latest_pollution(site_id);
+CREATE INDEX IF NOT EXISTS idx_mv_pollution_pi ON mv_site_latest_pollution(pollution_index DESC);
+CREATE INDEX IF NOT EXISTS idx_mv_pollution_metal ON mv_site_latest_pollution(metal_type);
+CREATE INDEX IF NOT EXISTS idx_mv_pollution_scale ON mv_site_latest_pollution(scale);
+
+-- 统计信息收集
+ANALYZE sites;
+ANALYZE xrf_measurements;
+ANALYZE pollution_fingerprints;
+ANALYZE remediation_technologies;
+
+-- ========================================
+-- 污染指数计算视图（保留向后兼容）
 -- ========================================
 CREATE OR REPLACE VIEW v_pollution_index AS
 SELECT
